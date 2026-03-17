@@ -1,0 +1,9 @@
+{
+  "name": "@openclaw/claude-runner",
+  "version": "0.1.0",
+  "description": "OpenClaw extension that spawns Claude Code CLI as a local LLM provider",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}

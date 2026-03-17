@@ -1,0 +1,8 @@
+{
+  "claudeBin": "claude",
+  "port": 7779,
+  "skipPermissions": true,
+  "maxTurns": 30,
+  "defaultModel": "claude-opus-4-5",
+  "workDir": "~/.openclaw/workspace"
+}

@@ -1,0 +1,16 @@
+{
+  "id": "claude-runner",
+  "name": "Claude Code Runner",
+  "description": "Spawns Claude Code CLI as a local provider — delegates all reasoning, tool use, and file editing to the CLI binary.",
+  "providers": ["claude-runner"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "description": "Enable or disable the extension"
+      }
+    }
+  }
+}
