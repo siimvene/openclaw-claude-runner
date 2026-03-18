@@ -85,13 +85,45 @@ function flattenContent(content: unknown): string {
   return String(content);
 }
 
+const PROMPT_HISTORY_MAX_MESSAGES = 24;
+const PROMPT_HISTORY_MAX_CHARS = 48_000;
+
+function formatRoleLabel(role: string): string {
+  switch (role) {
+    case "user":
+      return "User";
+    case "assistant":
+      return "Assistant";
+    case "tool":
+      return "Tool";
+    case "system":
+      return "System";
+    default:
+      return role[0]?.toUpperCase() + role.slice(1);
+  }
+}
+
+function trimPromptHistory(text: string, maxChars = PROMPT_HISTORY_MAX_CHARS): string {
+  if (text.length <= maxChars) return text;
+  return `[Earlier conversation truncated]\n\n${text.slice(-maxChars)}`;
+}
+
 function extractPromptFromMessages(messages: Array<{ role: string; content: unknown }>): string {
-  // Take only the latest user message as the prompt.
-  // Conversation history is managed by claude CLI sessions (--resume).
-  // Passing all prior turns as -p would duplicate context and bloat the prompt.
-  const userMsgs = messages.filter((m) => m.role === "user");
-  if (userMsgs.length === 0) return "";
-  return flattenContent(userMsgs[userMsgs.length - 1].content);
+  // OpenClaw already manages session continuity by sending conversation history.
+  // The bridge must preserve that history instead of discarding everything except
+  // the latest user message. Otherwise every subprocess run feels fresh.
+  const conversational = messages
+    .filter((m) => m.role !== "system")
+    .slice(-PROMPT_HISTORY_MAX_MESSAGES)
+    .map((m) => {
+      const content = flattenContent(m.content).trim();
+      if (!content) return "";
+      return `${formatRoleLabel(m.role)}:\n${content}`;
+    })
+    .filter(Boolean)
+    .join("\n\n");
+
+  return trimPromptHistory(conversational);
 }
 
 function extractSystemPrompt(messages: Array<{ role: string; content: unknown }>): string | undefined {
