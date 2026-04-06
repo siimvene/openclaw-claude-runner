@@ -1,54 +1,149 @@
 /**
- * Claude Code CLI Bridge Server
+ * Claude Agent SDK Bridge Server
  *
  * Embeds a tiny HTTP server that speaks OpenAI chat completions protocol.
- * When OpenClaw sends a request, it spawns `claude` CLI and translates
- * the NDJSON streaming output into SSE chunks.
+ * When OpenClaw sends a request, it invokes the Claude Agent SDK's query()
+ * function and translates the streaming messages into SSE chunks.
  *
  * Features:
- *   - Line-buffered NDJSON parser (handles split chunks)
+ *   - Agent SDK (no CLI subprocess, no TUI, no PTY)
+ *   - Session reuse via SDK resume
+ *   - Request queue with randomized jitter
+ *   - Structured streaming via includePartialMessages
  *   - Retry with exponential backoff on transient errors
- *   - --max-turns safety cap to prevent runaway loops
- *   - Session resume via x-session-id header
+ *   - AbortController-based cancellation
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 
 export interface BridgeConfig {
   port: number;
-  claudeBin: string;
-  skipPermissions: boolean;
   workDir: string;
+  skipPermissions: boolean;
   maxTurns?: number;
   maxRetries?: number;
-}
-
-interface LiveProcess {
-  proc: ChildProcess;
-  abortReason?: string;
+  queueMinDelayMs?: number;
+  queueMaxDelayMs?: number;
+  queueMaxConcurrency?: number;
+  sessionTtlMs?: number;
+  tools?: string[];
+  effort?: "low" | "medium" | "high" | "max";
+  maxBudgetUsd?: number;
 }
 
 const DEFAULT_MAX_TURNS = 30;
 const MAX_RETRIES = 2;
 const RETRY_DELAYS = [1000, 2000];
-const KILL_ESCALATION_MS = 2000;
 
-const liveProcesses = new Map<string, LiveProcess>();
+// Track active queries for cancellation
+const activeQueries = new Map<string, AbortController>();
 
-// ── Env cleanup ──────────────────────────────────────────────────────
+// ── Session Store ───────────────────────────────────────────────────
 
-function buildCleanEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  for (const key of Object.keys(env)) {
-    if (key.startsWith("CLAUDECODE") || key.startsWith("CLAUDE_CODE_")) {
-      delete env[key];
-    }
-  }
-  return env;
+interface SessionEntry {
+  claudeSessionId: string;
+  lastUsed: number;
 }
 
-// ── Transient error detection ────────────────────────────────────────
+class SessionStore {
+  private sessions = new Map<string, SessionEntry>();
+  private readonly ttlMs: number;
+
+  constructor(ttlMs = 3_600_000) {
+    this.ttlMs = ttlMs;
+  }
+
+  get(conversationId: string): string | undefined {
+    const entry = this.sessions.get(conversationId);
+    if (!entry) return undefined;
+    if (Date.now() - entry.lastUsed > this.ttlMs) {
+      this.sessions.delete(conversationId);
+      return undefined;
+    }
+    return entry.claudeSessionId;
+  }
+
+  record(conversationId: string, claudeSessionId: string): void {
+    this.sessions.set(conversationId, { claudeSessionId, lastUsed: Date.now() });
+  }
+
+  clear(): void {
+    this.sessions.clear();
+  }
+}
+
+// ── Request Queue ───────────────────────────────────────────────────
+
+class RequestQueue {
+  private queue: Array<{
+    execute: () => Promise<void>;
+    resolve: () => void;
+    reject: (err: Error) => void;
+    enqueued: number;
+  }> = [];
+  private active = 0;
+  private readonly maxConcurrency: number;
+  private readonly minDelayMs: number;
+  private readonly maxDelayMs: number;
+  private readonly queueTimeoutMs: number;
+  private lastSpawnTime = 0;
+
+  constructor(maxConcurrency = 1, minDelayMs = 1000, maxDelayMs = 4000, queueTimeoutMs = 60_000) {
+    this.maxConcurrency = maxConcurrency;
+    this.minDelayMs = minDelayMs;
+    this.maxDelayMs = maxDelayMs;
+    this.queueTimeoutMs = queueTimeoutMs;
+  }
+
+  enqueue(fn: () => Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.queue.push({ execute: fn, resolve, reject, enqueued: Date.now() });
+      this.drain();
+    });
+  }
+
+  private async drain(): Promise<void> {
+    if (this.active >= this.maxConcurrency || this.queue.length === 0) return;
+
+    const item = this.queue.shift()!;
+
+    if (Date.now() - item.enqueued > this.queueTimeoutMs) {
+      item.reject(new Error("Request timed out in queue"));
+      this.drain();
+      return;
+    }
+
+    this.active++;
+
+    const elapsed = Date.now() - this.lastSpawnTime;
+    const jitter = this.minDelayMs + Math.random() * (this.maxDelayMs - this.minDelayMs);
+    const wait = Math.max(0, jitter - elapsed);
+    if (wait > 0) {
+      await new Promise((r) => setTimeout(r, wait));
+    }
+
+    this.lastSpawnTime = Date.now();
+
+    try {
+      await item.execute();
+      item.resolve();
+    } catch (err: any) {
+      item.reject(err);
+    } finally {
+      this.active--;
+      this.drain();
+    }
+  }
+}
+
+// ── Module-level instances ──────────────────────────────────────────
+
+let sessionStore: SessionStore;
+let requestQueue: RequestQueue;
+
+// ── Transient error detection ───────────────────────────────────────
 
 const TRANSIENT_PATTERNS = [
   /ECONNRESET/i,
@@ -61,14 +156,12 @@ const TRANSIENT_PATTERNS = [
   /too many requests/i,
 ];
 
-function isTransientError(stderr: string, code: number | null): boolean {
-  if (code === null) return false;
-  return TRANSIENT_PATTERNS.some((p) => p.test(stderr));
+function isTransientError(message: string): boolean {
+  return TRANSIENT_PATTERNS.some((p) => p.test(message));
 }
 
-// ── Message extraction ───────────────────────────────────────────────
+// ── Message extraction ──────────────────────────────────────────────
 
-// content can be a string or an array of {type:"text",text:"..."} parts
 function flattenContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -109,9 +202,7 @@ function trimPromptHistory(text: string, maxChars = PROMPT_HISTORY_MAX_CHARS): s
 }
 
 function extractPromptFromMessages(messages: Array<{ role: string; content: unknown }>): string {
-  // OpenClaw already manages session continuity by sending conversation history.
-  // The bridge must preserve that history instead of discarding everything except
-  // the latest user message. Otherwise every subprocess run feels fresh.
+  // OpenClaw sends conversation history. Preserve it so the SDK has full context.
   const conversational = messages
     .filter((m) => m.role !== "system")
     .slice(-PROMPT_HISTORY_MAX_MESSAGES)
@@ -133,106 +224,22 @@ function extractSystemPrompt(messages: Array<{ role: string; content: unknown }>
   return full || undefined;
 }
 
-// ── Line-buffered NDJSON parser ──────────────────────────────────────
-// Handles chunks that split mid-line across `data` events from stdout.
+// ── Session resolution ──────────────────────────────────────────────
 
-class NdjsonParser {
-  private buffer = "";
-  private handler: (event: { type: string; [key: string]: any }) => void;
-
-  constructor(handler: (event: { type: string; [key: string]: any }) => void) {
-    this.handler = handler;
-  }
-
-  feed(chunk: string): void {
-    this.buffer += chunk;
-    const lines = this.buffer.split("\n");
-    // Keep the last (possibly incomplete) line in the buffer
-    this.buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const event = JSON.parse(trimmed);
-        if (event.type) this.handler(event);
-      } catch {
-        // Not valid JSON — skip
-      }
-    }
-  }
-
-  flush(): void {
-    if (this.buffer.trim()) {
-      try {
-        const event = JSON.parse(this.buffer.trim());
-        if (event.type) this.handler(event);
-      } catch {
-        // Ignore trailing incomplete data
-      }
-    }
-    this.buffer = "";
-  }
+function resolveConversationId(
+  req: IncomingMessage,
+  body: Record<string, any>,
+): string | undefined {
+  return (
+    (req.headers["x-session-id"] as string) ||
+    (req.headers["x-conversation-id"] as string) ||
+    body.conversation_id ||
+    body.metadata?.conversation_id ||
+    undefined
+  );
 }
 
-// ── Process lifecycle ────────────────────────────────────────────────
-
-function killProcess(id: string): void {
-  const live = liveProcesses.get(id);
-  if (!live) return;
-  live.abortReason = "killed";
-
-  try {
-    if (live.proc.pid) process.kill(-live.proc.pid, "SIGTERM");
-  } catch {
-    live.proc.kill("SIGTERM");
-  }
-
-  setTimeout(() => {
-    if (liveProcesses.has(id)) {
-      try {
-        if (live.proc.pid) process.kill(-live.proc.pid, "SIGKILL");
-      } catch {
-        live.proc.kill("SIGKILL");
-      }
-    }
-  }, KILL_ESCALATION_MS);
-}
-
-// ── Core: spawn claude CLI ───────────────────────────────────────────
-
-interface SpawnOpts {
-  prompt: string;
-  model: string;
-  systemPrompt?: string;
-  sessionId?: string;
-  config: BridgeConfig;
-}
-
-function buildArgs(opts: SpawnOpts): string[] {
-  const args: string[] = ["-p", opts.prompt, "--output-format", "stream-json", "--verbose"];
-
-  if (opts.config.skipPermissions) {
-    args.push("--dangerously-skip-permissions");
-  }
-
-  const cleanModel = opts.model.replace(/^claude-runner\//, "");
-  args.push("--model", cleanModel);
-
-  const maxTurns = opts.config.maxTurns ?? DEFAULT_MAX_TURNS;
-  args.push("--max-turns", String(maxTurns));
-
-  if (opts.systemPrompt) {
-    args.push("--append-system-prompt", opts.systemPrompt);
-  }
-
-  if (opts.sessionId) {
-    args.push("--resume", opts.sessionId);
-  }
-
-  return args;
-}
-
-// ── Request handler ──────────────────────────────────────────────────
+// ── Request handler ─────────────────────────────────────────────────
 
 async function handleCompletions(
   req: IncomingMessage,
@@ -243,16 +250,23 @@ async function handleCompletions(
   for await (const chunk of req) {
     chunks.push(chunk as Buffer);
   }
-  const body = JSON.parse(Buffer.concat(chunks).toString());
+  let body: Record<string, any>;
+  try {
+    body = JSON.parse(Buffer.concat(chunks).toString());
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }));
+    return;
+  }
 
   const messages: Array<{ role: string; content: string }> = body.messages ?? [];
   const stream = body.stream !== false;
-  const model = body.model ?? "claude-opus-4-5";
-  const sessionId = (req.headers["x-session-id"] as string) || undefined;
+  const model = body.model?.replace(/^claude-runner\//, "") ?? "claude-opus-4-5";
   const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   const prompt = extractPromptFromMessages(messages);
   const systemPrompt = extractSystemPrompt(messages);
+  const conversationId = resolveConversationId(req, body);
 
   if (!prompt) {
     res.writeHead(400, { "Content-Type": "application/json" });
@@ -260,11 +274,44 @@ async function handleCompletions(
     return;
   }
 
-  const spawnOpts: SpawnOpts = { prompt, model, systemPrompt, sessionId, config };
+  try {
+    await requestQueue.enqueue(async () => {
+      await executeWithRetries(prompt, model, systemPrompt, conversationId, stream, res, requestId, config);
+    });
+  } catch (err: any) {
+    if (!res.headersSent) {
+      const status = err.message?.includes("timed out in queue") ? 503 : 502;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: err.message || "Request failed", type: "server_error" } }));
+    }
+  }
+}
 
-  // Retry loop for transient errors
+async function executeWithRetries(
+  prompt: string,
+  model: string,
+  systemPrompt: string | undefined,
+  conversationId: string | undefined,
+  stream: boolean,
+  res: ServerResponse,
+  requestId: string,
+  config: BridgeConfig,
+): Promise<void> {
   const maxRetries = config.maxRetries ?? MAX_RETRIES;
   let lastError = "";
+
+  // Resolve session
+  let resumeSessionId: string | undefined;
+  let newSessionId: string | undefined;
+
+  if (conversationId) {
+    const existing = sessionStore.get(conversationId);
+    if (existing) {
+      resumeSessionId = existing;
+    } else {
+      newSessionId = randomUUID();
+    }
+  }
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (attempt > 0) {
@@ -274,49 +321,102 @@ async function handleCompletions(
 
     try {
       if (stream) {
-        await handleStreamingResponse(spawnOpts, res, requestId);
+        await handleStreamingResponse(prompt, model, systemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
       } else {
-        await handleNonStreamingResponse(spawnOpts, res, requestId);
+        await handleNonStreamingResponse(prompt, model, systemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
       }
-      return; // Success — exit retry loop
+      return;
     } catch (err: any) {
-      lastError = err.stderr ?? err.message ?? String(err);
+      lastError = err.message ?? String(err);
 
-      // If response headers already sent (streaming started), can't retry
       if (res.headersSent) return;
 
-      if (!isTransientError(lastError, err.exitCode ?? null)) {
-        break; // Non-transient — don't retry
+      // Stale session — retry with fresh
+      if (resumeSessionId && /no conversation found|session/i.test(lastError)) {
+        resumeSessionId = undefined;
+        newSessionId = randomUUID();
+        if (conversationId) sessionStore.record(conversationId, newSessionId);
+        continue;
+      }
+
+      if (!isTransientError(lastError)) {
+        break;
       }
     }
   }
 
-  // All retries exhausted
   if (!res.headersSent) {
     res.writeHead(502, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: lastError || "claude CLI failed after retries", type: "server_error" } }));
+    res.end(JSON.stringify({ error: { message: lastError || "SDK query failed after retries", type: "server_error" } }));
   }
 }
 
-// ── Streaming response ───────────────────────────────────────────────
+// ── Build SDK options ───────────────────────────────────────────────
+
+function buildQueryOptions(
+  model: string,
+  systemPrompt: string | undefined,
+  resumeSessionId: string | undefined,
+  newSessionId: string | undefined,
+  config: BridgeConfig,
+  abortController: AbortController,
+): Record<string, any> {
+  const opts: Record<string, any> = {
+    model,
+    cwd: config.workDir,
+    maxTurns: config.maxTurns ?? DEFAULT_MAX_TURNS,
+    includePartialMessages: true,
+    abortController,
+  };
+
+  if (config.skipPermissions) {
+    opts.permissionMode = "bypassPermissions";
+    opts.allowDangerouslySkipPermissions = true;
+  }
+
+  if (resumeSessionId) {
+    opts.resume = resumeSessionId;
+  } else if (newSessionId) {
+    opts.sessionId = newSessionId;
+  }
+
+  if (systemPrompt) {
+    opts.systemPrompt = systemPrompt;
+  }
+
+  if (config.tools) {
+    opts.tools = config.tools;
+  }
+
+  if (config.effort) {
+    opts.effort = config.effort;
+  }
+
+  if (config.maxBudgetUsd) {
+    opts.maxBudgetUsd = config.maxBudgetUsd;
+  }
+
+  return opts;
+}
+
+// ── Streaming response ──────────────────────────────────────────────
 
 async function handleStreamingResponse(
-  opts: SpawnOpts,
+  prompt: string,
+  model: string,
+  systemPrompt: string | undefined,
+  resumeSessionId: string | undefined,
+  newSessionId: string | undefined,
+  conversationId: string | undefined,
   res: ServerResponse,
   requestId: string,
+  config: BridgeConfig,
 ): Promise<void> {
-  const args = buildArgs(opts);
-  const cleanEnv = buildCleanEnv();
-  const model = opts.model.replace(/^claude-runner\//, "");
+  const abortController = new AbortController();
+  const options = buildQueryOptions(model, systemPrompt, resumeSessionId, newSessionId, config, abortController);
 
-  const proc = spawn(opts.config.claudeBin, args, {
-    cwd: opts.config.workDir,
-    env: cleanEnv,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: process.platform !== "win32",
-  });
-
-  liveProcesses.set(requestId, { proc });
+  const q = query({ prompt, options });
+  activeQueries.set(requestId, abortController);
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -338,168 +438,160 @@ async function handleStreamingResponse(
   });
 
   let resultText = "";
-  let stderr = "";
+  let streamedDelta = false;
 
-  const parser = new NdjsonParser((event) => {
-    if (event.type === "content_block_delta" && event.delta?.type === "text_delta" && event.delta.text) {
-      sendSSE({
-        id: requestId,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }],
-      });
-    } else if (event.type === "result") {
-      resultText = event.result ?? event.text ?? "";
+  try {
+    for await (const msg of q) {
+      // Token-level streaming deltas
+      if (msg.type === "stream_event") {
+        const event = (msg as any).event;
+        if (event?.type === "content_block_delta" && event.delta?.type === "text_delta" && event.delta.text) {
+          streamedDelta = true;
+          sendSSE({
+            id: requestId,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }],
+          });
+        }
+      }
+
+      // Full assistant message (fallback)
+      if (msg.type === "assistant") {
+        const content = (msg as any).message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "text" && block.text && !streamedDelta) {
+              resultText = block.text;
+            }
+          }
+        }
+      }
+
+      // Result — session ID and completion
+      if (msg.type === "result") {
+        const result = msg as any;
+        if (conversationId && result.session_id) {
+          sessionStore.record(conversationId, result.session_id);
+        }
+        if (result.subtype === "success" && result.result && !streamedDelta) {
+          resultText = result.result;
+        }
+      }
     }
-  });
-
-  proc.stdout!.on("data", (chunk: Buffer) => {
-    parser.feed(chunk.toString());
-  });
-
-  proc.stderr!.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-
-  return new Promise<void>((resolve, reject) => {
-    proc.on("close", (code) => {
-      parser.flush();
-      liveProcesses.delete(requestId);
-
-      // If we got a result but no streaming deltas, send it as a single chunk
-      if (resultText && !res.writableEnded) {
-        sendSSE({
-          id: requestId,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, delta: { content: resultText }, finish_reason: null }],
-        });
-      }
-
+  } catch (err: any) {
+    if (!res.writableEnded) {
       sendSSE({
         id: requestId,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
         model,
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        choices: [{ index: 0, delta: { content: `\n\nError: ${err.message}` }, finish_reason: "stop" }],
       });
-      res.write("data: [DONE]\n\n");
-      res.end();
-      resolve();
-    });
+    }
+  } finally {
+    activeQueries.delete(requestId);
+  }
 
-    proc.on("error", (err) => {
-      liveProcesses.delete(requestId);
-      if (!res.headersSent) {
-        // Propagate for retry
-        const wrapped: any = new Error(err.message);
-        wrapped.stderr = stderr;
-        reject(wrapped);
-      } else {
-        sendSSE({
-          id: requestId,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, delta: { content: `\n\nError: ${err.message}` }, finish_reason: "stop" }],
-        });
-        res.write("data: [DONE]\n\n");
-        res.end();
-        resolve();
-      }
+  if (!res.writableEnded) {
+    // Fallback: send result as one chunk if no streaming deltas came through
+    if (resultText && !streamedDelta) {
+      sendSSE({
+        id: requestId,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, delta: { content: resultText }, finish_reason: null }],
+      });
+    }
+
+    sendSSE({
+      id: requestId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
     });
-  });
+    res.write("data: [DONE]\n\n");
+    res.end();
+  }
 }
 
-// ── Non-streaming response ───────────────────────────────────────────
+// ── Non-streaming response ──────────────────────────────────────────
 
 async function handleNonStreamingResponse(
-  opts: SpawnOpts,
+  prompt: string,
+  model: string,
+  systemPrompt: string | undefined,
+  resumeSessionId: string | undefined,
+  newSessionId: string | undefined,
+  conversationId: string | undefined,
   res: ServerResponse,
   requestId: string,
+  config: BridgeConfig,
 ): Promise<void> {
-  const args = buildArgs(opts);
-  const cleanEnv = buildCleanEnv();
-  const model = opts.model.replace(/^claude-runner\//, "");
+  const abortController = new AbortController();
+  const options = buildQueryOptions(model, systemPrompt, resumeSessionId, newSessionId, config, abortController);
 
-  const proc = spawn(opts.config.claudeBin, args, {
-    cwd: opts.config.workDir,
-    env: cleanEnv,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: process.platform !== "win32",
-  });
-
-  liveProcesses.set(requestId, { proc });
+  const q = query({ prompt, options });
+  activeQueries.set(requestId, abortController);
 
   let resultText = "";
-  let stderr = "";
 
-  const parser = new NdjsonParser((event) => {
-    if (event.type === "result") {
-      resultText = event.result ?? event.text ?? "";
-    }
-  });
-
-  proc.stdout!.on("data", (chunk: Buffer) => {
-    parser.feed(chunk.toString());
-  });
-
-  proc.stderr!.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-
-  return new Promise<void>((resolve, reject) => {
-    proc.on("close", (code) => {
-      parser.flush();
-      liveProcesses.delete(requestId);
-
-      if (!resultText && code !== 0) {
-        const wrapped: any = new Error(stderr || `claude exited with code ${code}`);
-        wrapped.exitCode = code;
-        wrapped.stderr = stderr;
-        reject(wrapped);
-        return;
+  try {
+    for await (const msg of q) {
+      if (msg.type === "result") {
+        const result = msg as any;
+        if (conversationId && result.session_id) {
+          sessionStore.record(conversationId, result.session_id);
+        }
+        if (result.subtype === "success") {
+          resultText = result.result ?? "";
+        } else {
+          const errors = result.errors?.join("; ") ?? "Unknown error";
+          throw new Error(errors);
+        }
       }
+    }
+  } finally {
+    activeQueries.delete(requestId);
+  }
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          id: requestId,
-          object: "chat.completion",
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [
-            {
-              index: 0,
-              message: { role: "assistant", content: resultText },
-              finish_reason: "stop",
-            },
-          ],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        }),
-      );
-      resolve();
-    });
-
-    proc.on("error", (err) => {
-      liveProcesses.delete(requestId);
-      const wrapped: any = new Error(err.message);
-      wrapped.stderr = stderr;
-      reject(wrapped);
-    });
-  });
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(
+    JSON.stringify({
+      id: requestId,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: resultText },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    }),
+  );
 }
 
-// ── Server lifecycle ─────────────────────────────────────────────────
+// ── Server lifecycle ────────────────────────────────────────────────
 
 export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<typeof createServer>> {
+  sessionStore = new SessionStore(config.sessionTtlMs);
+  requestQueue = new RequestQueue(
+    config.queueMaxConcurrency ?? 1,
+    config.queueMinDelayMs ?? 1000,
+    config.queueMaxDelayMs ?? 4000,
+  );
+
   return new Promise((resolve, reject) => {
     const server = createServer(async (req, res) => {
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Conversation-Id");
 
       if (req.method === "OPTIONS") {
         res.writeHead(204);
@@ -509,7 +601,7 @@ export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<type
 
       if (req.url === "/health" || req.url === "/v1/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok", liveProcesses: liveProcesses.size }));
+        res.end(JSON.stringify({ status: "ok", activeQueries: activeQueries.size }));
         return;
       }
 
@@ -519,6 +611,7 @@ export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<type
           JSON.stringify({
             object: "list",
             data: [
+              { id: "claude-opus-4-6", object: "model", owned_by: "anthropic" },
               { id: "claude-opus-4-5", object: "model", owned_by: "anthropic" },
               { id: "claude-sonnet-4-6", object: "model", owned_by: "anthropic" },
               { id: "claude-sonnet-4", object: "model", owned_by: "anthropic" },
@@ -554,10 +647,12 @@ export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<type
 }
 
 export function stopBridgeServer(server: ReturnType<typeof createServer>): Promise<void> {
-  for (const [id] of liveProcesses) {
-    killProcess(id);
+  // Abort all active queries
+  for (const [, controller] of activeQueries) {
+    controller.abort();
   }
-  liveProcesses.clear();
+  activeQueries.clear();
+  sessionStore.clear();
 
   return new Promise((resolve) => {
     server.close(() => resolve());

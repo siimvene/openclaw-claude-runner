@@ -1,8 +1,12 @@
 {
-  "claudeBin": "claude",
   "port": 7779,
   "skipPermissions": true,
   "maxTurns": 30,
-  "defaultModel": "claude-opus-4-5",
-  "workDir": "~/.openclaw/workspace"
+  "defaultModel": "claude-opus-4-6",
+  "workDir": "~/.openclaw/workspace",
+  "queueMinDelayMs": 1000,
+  "queueMaxDelayMs": 4000,
+  "queueMaxConcurrency": 1,
+  "sessionTtlMs": 3600000,
+  "effort": "medium"
 }

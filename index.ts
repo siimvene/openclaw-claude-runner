@@ -1,15 +1,14 @@
 /**
  * OpenClaw Claude Runner Extension
  *
- * Registers "claude-runner" as an LLM provider that spawns Claude Code CLI
- * as a subprocess. All intelligence is delegated to the CLI — tool use,
- * file editing, multi-step reasoning, MCP servers, memory.
+ * Registers "claude-runner" as an LLM provider that uses the Claude Agent SDK.
+ * All intelligence is delegated to the SDK — tool use, file editing,
+ * multi-step reasoning, MCP servers, memory.
  *
  * Architecture:
  *   OpenClaw Gateway → provider: "claude-runner"
  *     → embedded bridge server (OpenAI-compat on localhost)
- *       → spawn `claude -p ... --output-format stream-json`
- *         → NDJSON → SSE translation → back to OpenClaw
+ *       → SDK query() → streaming SDKMessage → SSE translation → back to OpenClaw
  */
 
 import { readFileSync } from "node:fs";
@@ -26,10 +25,8 @@ import { startBridgeServer, stopBridgeServer } from "./src/claude-bridge.js";
 
 const PROVIDER_ID = "claude-runner";
 const DEFAULT_PORT = 7779;
-const DEFAULT_CLAUDE_BIN = "claude";
 const DEFAULT_WORK_DIR = "~/.openclaw/workspace";
 
-// Load config from extension's own config.json (not openclaw.json)
 function loadExtensionConfig(): Record<string, unknown> {
   try {
     const extDir = dirname(fileURLToPath(import.meta.url));
@@ -42,17 +39,26 @@ function loadExtensionConfig(): Record<string, unknown> {
 
 const MODELS = [
   {
-    id: "claude-opus-4-5",
-    name: "Claude Opus 4.5 (CLI)",
+    id: "claude-opus-4-6",
+    name: "Claude Opus 4.6 (SDK)",
     reasoning: true,
     input: ["text", "image"] as Array<"text" | "image">,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, // Max plan = flat rate
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200_000,
+    maxTokens: 16_384,
+  },
+  {
+    id: "claude-opus-4-5",
+    name: "Claude Opus 4.5 (SDK)",
+    reasoning: true,
+    input: ["text", "image"] as Array<"text" | "image">,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 200_000,
     maxTokens: 16_384,
   },
   {
     id: "claude-sonnet-4-6",
-    name: "Claude Sonnet 4.6 (CLI)",
+    name: "Claude Sonnet 4.6 (SDK)",
     reasoning: true,
     input: ["text", "image"] as Array<"text" | "image">,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -61,7 +67,7 @@ const MODELS = [
   },
   {
     id: "claude-sonnet-4",
-    name: "Claude Sonnet 4 (CLI)",
+    name: "Claude Sonnet 4 (SDK)",
     reasoning: false,
     input: ["text", "image"] as Array<"text" | "image">,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -70,7 +76,7 @@ const MODELS = [
   },
   {
     id: "claude-haiku-4-5",
-    name: "Claude Haiku 4.5 (CLI)",
+    name: "Claude Haiku 4.5 (SDK)",
     reasoning: false,
     input: ["text"] as Array<"text" | "image">,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -81,55 +87,105 @@ const MODELS = [
 
 let bridgeServer: Awaited<ReturnType<typeof startBridgeServer>> | null = null;
 
+interface BridgeOpts {
+  port: number;
+  skipPermissions: boolean;
+  maxTurns: number;
+  queueMinDelayMs?: number;
+  queueMaxDelayMs?: number;
+  queueMaxConcurrency?: number;
+  sessionTtlMs?: number;
+  tools?: string[];
+  effort?: "low" | "medium" | "high" | "max";
+  maxBudgetUsd?: number;
+}
+
+async function ensureBridgeRunning(
+  ctx: {
+    workspaceDir?: string;
+    logger?: {
+      info?: (value: string) => void;
+      error?: (value: string) => void;
+    };
+  } = {},
+  config: BridgeOpts,
+) {
+  if (bridgeServer) return;
+
+  try {
+    const rawWorkDir = ctx.workspaceDir ?? DEFAULT_WORK_DIR;
+    const workDir = rawWorkDir.startsWith("~") ? rawWorkDir.replace("~", homedir()) : rawWorkDir;
+    bridgeServer = await startBridgeServer({
+      port: config.port,
+      skipPermissions: config.skipPermissions,
+      workDir,
+      maxTurns: config.maxTurns,
+      queueMinDelayMs: config.queueMinDelayMs,
+      queueMaxDelayMs: config.queueMaxDelayMs,
+      queueMaxConcurrency: config.queueMaxConcurrency,
+      sessionTtlMs: config.sessionTtlMs,
+      tools: config.tools,
+      effort: config.effort,
+      maxBudgetUsd: config.maxBudgetUsd,
+    });
+    ctx.logger?.info?.(`Claude Runner bridge listening on 127.0.0.1:${config.port}`);
+  } catch (err) {
+    const details = err instanceof Error ? err.message : String(err);
+    ctx.logger?.error?.(`Failed to start Claude Runner bridge: ${details}`);
+    throw err;
+  }
+}
+
 const claudeRunnerPlugin = {
   id: PROVIDER_ID,
   name: "Claude Code Runner",
-  description: "Spawns Claude Code CLI locally — full agentic capabilities via Max plan",
+  description: "Uses Claude Agent SDK locally — full agentic capabilities via Max plan",
 
   register(api: OpenClawPluginApi) {
     const extConfig = loadExtensionConfig();
-    const claudeBin = (extConfig.claudeBin as string) ?? DEFAULT_CLAUDE_BIN;
     const port = (extConfig.port as number) ?? DEFAULT_PORT;
     const skipPermissions = (extConfig.skipPermissions as boolean) ?? true;
-    const defaultModel = (extConfig.defaultModel as string) ?? "claude-opus-4-5";
+    const defaultModel = (extConfig.defaultModel as string) ?? "claude-opus-4-6";
     const maxTurns = (extConfig.maxTurns as number) ?? 30;
 
-    // Register the bridge as a background service
+    const bridgeOpts: BridgeOpts = {
+      port,
+      skipPermissions,
+      maxTurns,
+      queueMinDelayMs: extConfig.queueMinDelayMs as number | undefined,
+      queueMaxDelayMs: extConfig.queueMaxDelayMs as number | undefined,
+      queueMaxConcurrency: extConfig.queueMaxConcurrency as number | undefined,
+      sessionTtlMs: extConfig.sessionTtlMs as number | undefined,
+      tools: extConfig.tools as string[] | undefined,
+      effort: extConfig.effort as BridgeOpts["effort"] | undefined,
+      maxBudgetUsd: extConfig.maxBudgetUsd as number | undefined,
+    };
+
     api.registerService({
       id: "claude-runner-bridge",
       start: async (ctx) => {
-        const rawWorkDir = ctx.workspaceDir ?? DEFAULT_WORK_DIR;
-        const workDir = rawWorkDir.startsWith("~") ? rawWorkDir.replace("~", homedir()) : rawWorkDir;
-        bridgeServer = await startBridgeServer({ port, claudeBin, skipPermissions, workDir, maxTurns });
-        ctx.logger.info(`Claude Runner bridge listening on 127.0.0.1:${port}`);
+        await ensureBridgeRunning(ctx, bridgeOpts);
       },
       stop: async (ctx) => {
         if (bridgeServer) {
           await stopBridgeServer(bridgeServer);
           bridgeServer = null;
-          ctx.logger.info("Claude Runner bridge stopped");
+          ctx.logger?.info?.("Claude Runner bridge stopped");
         }
       },
     });
 
-    // Register as a provider
     api.registerProvider({
       id: PROVIDER_ID,
-      label: "Claude Code CLI",
+      label: "Claude Agent SDK",
       docsPath: "/providers/models",
       auth: [
         {
           id: "local",
-          label: "Local Claude CLI",
-          hint: "Uses locally installed Claude Code CLI binary (requires Max plan)",
+          label: "Local Claude Agent SDK",
+          hint: "Uses Claude Agent SDK with Max plan subscription",
           kind: "custom",
           run: async (ctx: ProviderAuthContext): Promise<ProviderAuthResult> => {
-            const binPath = await ctx.prompter.text({
-              message: "Path to claude binary",
-              initialValue: claudeBin,
-              validate: (v: string) => (v.trim() ? undefined : "Path is required"),
-            });
-
             const bridgePort = await ctx.prompter.text({
               message: "Bridge server port",
               initialValue: String(port),
@@ -181,9 +237,9 @@ const claudeRunnerPlugin = {
               },
               defaultModel: `${PROVIDER_ID}/${defaultModel}`,
               notes: [
-                "Claude Code CLI must be installed (npm i -g @anthropic-ai/claude-code).",
-                "Requires an active Anthropic Max subscription for --dangerously-skip-permissions.",
-                "All reasoning, tool use, and file editing is handled by the CLI — zero cost per token on Max plan.",
+                "Claude Agent SDK is used (npm: @anthropic-ai/claude-agent-sdk).",
+                "Requires an active Anthropic Max subscription.",
+                "Full agentic capabilities: tool use, file editing, MCP, memory — zero cost per token on Max plan.",
               ],
             };
           },
@@ -194,6 +250,7 @@ const claudeRunnerPlugin = {
         run: async (ctx: ProviderDiscoveryContext) => {
           const explicit = ctx.config.models?.providers?.[PROVIDER_ID];
           if (explicit && Array.isArray(explicit.models) && explicit.models.length > 0) {
+            await ensureBridgeRunning(ctx, bridgeOpts);
             return {
               provider: {
                 ...explicit,
@@ -205,9 +262,9 @@ const claudeRunnerPlugin = {
             };
           }
 
-          // Auto-discover if plugin is enabled but provider not yet configured
           const pluginEnabled = ctx.config.plugins?.entries?.["claude-runner"];
           if (pluginEnabled) {
+            await ensureBridgeRunning(ctx, bridgeOpts);
             return {
               provider: {
                 baseUrl: `http://127.0.0.1:${port}/v1`,
@@ -225,16 +282,16 @@ const claudeRunnerPlugin = {
       wizard: {
         onboarding: {
           choiceId: "claude-runner",
-          choiceLabel: "Claude Code CLI",
-          choiceHint: "Full agentic Claude via local CLI (Max plan)",
+          choiceLabel: "Claude Agent SDK",
+          choiceHint: "Full agentic Claude via SDK (Max plan)",
           groupId: "claude-runner",
-          groupLabel: "Claude Code CLI",
-          groupHint: "Spawn Claude Code CLI for full tool use and file editing",
+          groupLabel: "Claude Agent SDK",
+          groupHint: "Use Claude Agent SDK for full tool use and file editing",
           methodId: "local",
         },
         modelPicker: {
-          label: "Claude Code CLI",
-          hint: "Use Claude Code CLI for full agentic capabilities",
+          label: "Claude Agent SDK",
+          hint: "Use Claude Agent SDK for full agentic capabilities",
           methodId: "local",
         },
       },

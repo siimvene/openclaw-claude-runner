@@ -1,23 +1,23 @@
 {
   "id": "claude-runner",
   "name": "Claude Code Runner",
-  "description": "Spawns Claude Code CLI as a local provider — delegates all reasoning, tool use, and file editing to the CLI binary.",
+  "description": "Uses Claude Agent SDK as a local provider — delegates all reasoning, tool use, and file editing to the SDK.",
   "providers": ["claude-runner"],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "claudeBin": {
-        "type": "string",
-        "description": "Path to the claude binary"
-      },
       "port": {
         "type": "number",
         "description": "Port for the local bridge server"
       },
+      "workDir": {
+        "type": "string",
+        "description": "Working directory for the SDK (default: ~/.openclaw/workspace)"
+      },
       "skipPermissions": {
         "type": "boolean",
-        "description": "Use --dangerously-skip-permissions flag"
+        "description": "Use bypassPermissions mode"
       },
       "defaultModel": {
         "type": "string",
@@ -26,6 +26,35 @@
       "maxTurns": {
         "type": "number",
         "description": "Max agentic turns per request (safety cap, default: 30)"
+      },
+      "queueMinDelayMs": {
+        "type": "number",
+        "description": "Minimum delay between SDK queries in ms (default: 1000)"
+      },
+      "queueMaxDelayMs": {
+        "type": "number",
+        "description": "Maximum delay between SDK queries in ms (default: 4000)"
+      },
+      "queueMaxConcurrency": {
+        "type": "number",
+        "description": "Max concurrent SDK queries (default: 1)"
+      },
+      "sessionTtlMs": {
+        "type": "number",
+        "description": "Session cache TTL in ms (default: 3600000)"
+      },
+      "effort": {
+        "type": "string",
+        "description": "Effort level: low, medium, high, max (default: medium)"
+      },
+      "maxBudgetUsd": {
+        "type": "number",
+        "description": "Max dollar budget per request"
+      },
+      "tools": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Allowed tools list (default: all claude_code tools)"
       }
     }
   }
