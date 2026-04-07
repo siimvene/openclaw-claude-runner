@@ -102,6 +102,18 @@ function buildContextEmbed(info: SessionInfo): EmbedBuilder | null {
     .setFooter({ text: parts.join(" \u00b7 ") });
 }
 
+async function compactSession(sessionId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${BRIDGE_URL}/sessions/${encodeURIComponent(sessionId)}/compact`, {
+      method: "POST",
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 // ── Main ───────────────────────────────────────────────────────────
 
 const client = new Client({
@@ -122,6 +134,47 @@ client.on(Events.ClientReady, () => {
 // Track messages we've already processed to avoid double-edits
 const processed = new Set<string>();
 const PROCESSED_MAX = 500;
+
+// ── User commands ──────────────────────────────────────────────────
+
+client.on(Events.MessageCreate, async (message: Message) => {
+  // Handle user commands (not from the bot itself)
+  if (message.author.bot) return;
+  const content = message.content.trim().toLowerCase();
+
+  if (content === "!compact") {
+    const sessions = await fetchAllSessions();
+    const session = findMostRecentSession(sessions);
+    if (!session) {
+      await message.reply("No active session to compact.");
+      return;
+    }
+    const ok = await compactSession(session.session_id);
+    if (ok) {
+      await message.reply(`Session compacted. Next message starts a fresh context.`);
+    } else {
+      await message.reply("Failed to compact session.");
+    }
+    return;
+  }
+
+  if (content === "!context") {
+    const sessions = await fetchAllSessions();
+    if (sessions.length === 0) {
+      await message.reply("No active sessions.");
+      return;
+    }
+    for (const s of sessions) {
+      const embed = buildContextEmbed(s);
+      if (embed) {
+        await message.reply({ embeds: [embed] });
+      }
+    }
+    return;
+  }
+});
+
+// ── Bot message embed overlay ──────────────────────────────────────
 
 client.on(Events.MessageCreate, async (message: Message) => {
   // Only process bot's own messages

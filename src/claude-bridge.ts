@@ -869,6 +869,21 @@ export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<type
         return;
       }
 
+      // Manual compaction endpoint
+      if (req.url?.startsWith("/v1/sessions/") && req.url.endsWith("/compact") && req.method === "POST") {
+        const sessionId = req.url.slice("/v1/sessions/".length, -"/compact".length);
+        const entry = sessionStore.get(sessionId);
+        if (!entry) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Session not found" }));
+        } else {
+          scheduleCompaction(sessionId, "Manual compaction requested by user.");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "compacted", session_id: sessionId }));
+        }
+        return;
+      }
+
       if (req.url === "/v1/chat/completions" && req.method === "POST") {
         try {
           await handleCompletions(req, res, config);
