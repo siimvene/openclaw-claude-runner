@@ -740,7 +740,7 @@ function extractContextUsage(modelUsage: Record<string, any>): ContextUsage | un
   let outputTokens = 0;
   let cacheReadInputTokens = 0;
   let cacheCreationInputTokens = 0;
-  let contextWindow = 200_000;
+  let contextWindow = 1_000_000;
   let costUsd = 0;
 
   for (const usage of Object.values(modelUsage)) {
