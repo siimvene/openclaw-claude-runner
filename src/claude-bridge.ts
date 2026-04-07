@@ -15,7 +15,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
 export interface BridgeConfig {
@@ -42,10 +42,27 @@ const activeQueries = new Map<string, AbortController>();
 
 // ── Session Store ───────────────────────────────────────────────────
 
+interface ContextUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  contextWindow: number;
+  totalTokens: number;
+  fillPercent: number;
+  costUsd: number;
+}
+
 interface SessionEntry {
   claudeSessionId: string;
   lastUsed: number;
+  turnCount: number;
+  contextUsage?: ContextUsage;
+  /** Compacted summary injected into new sessions after rotation */
+  compactSummary?: string;
 }
+
+const COMPACT_FILL_THRESHOLD = 0.75;
 
 class SessionStore {
   private sessions = new Map<string, SessionEntry>();
@@ -55,18 +72,86 @@ class SessionStore {
     this.ttlMs = ttlMs;
   }
 
-  get(conversationId: string): string | undefined {
+  get(conversationId: string): SessionEntry | undefined {
     const entry = this.sessions.get(conversationId);
     if (!entry) return undefined;
     if (Date.now() - entry.lastUsed > this.ttlMs) {
       this.sessions.delete(conversationId);
       return undefined;
     }
-    return entry.claudeSessionId;
+    // Touch on read to prevent premature TTL expiry
+    entry.lastUsed = Date.now();
+    return entry;
+  }
+
+  getSessionId(conversationId: string): string | undefined {
+    return this.get(conversationId)?.claudeSessionId;
   }
 
   record(conversationId: string, claudeSessionId: string): void {
-    this.sessions.set(conversationId, { claudeSessionId, lastUsed: Date.now() });
+    const existing = this.sessions.get(conversationId);
+    this.sessions.set(conversationId, {
+      claudeSessionId,
+      lastUsed: Date.now(),
+      turnCount: (existing?.turnCount ?? 0) + 1,
+      contextUsage: existing?.contextUsage,
+      compactSummary: existing?.compactSummary,
+    });
+  }
+
+  updateContextUsage(conversationId: string, usage: ContextUsage): void {
+    const entry = this.sessions.get(conversationId);
+    if (entry) {
+      entry.contextUsage = usage;
+    }
+  }
+
+  /** Mark session as needing rotation — store summary for next request */
+  setCompactSummary(conversationId: string, summary: string): void {
+    const entry = this.sessions.get(conversationId);
+    if (entry) {
+      entry.compactSummary = summary;
+    }
+  }
+
+  /** Consume and clear the compact summary (used when starting a new session) */
+  consumeCompactSummary(conversationId: string): string | undefined {
+    const entry = this.sessions.get(conversationId);
+    if (!entry?.compactSummary) return undefined;
+    const summary = entry.compactSummary;
+    entry.compactSummary = undefined;
+    return summary;
+  }
+
+  /** Reset session for compaction — clears the SDK session ID so next request starts fresh */
+  rotateSession(conversationId: string, summary: string): void {
+    const entry = this.sessions.get(conversationId);
+    if (entry) {
+      entry.compactSummary = summary;
+      entry.claudeSessionId = ''; // Force new session on next request
+      entry.contextUsage = undefined;
+      entry.turnCount = 0;
+    }
+  }
+
+  needsCompaction(conversationId: string): boolean {
+    const entry = this.sessions.get(conversationId);
+    if (!entry?.contextUsage) return false;
+    return entry.contextUsage.fillPercent >= COMPACT_FILL_THRESHOLD;
+  }
+
+  getContextInfo(conversationId: string): ContextUsage | undefined {
+    return this.get(conversationId)?.contextUsage;
+  }
+
+  getAllSessions(): Array<{ conversationId: string; entry: SessionEntry }> {
+    const result: Array<{ conversationId: string; entry: SessionEntry }> = [];
+    for (const [conversationId, entry] of this.sessions) {
+      if (Date.now() - entry.lastUsed <= this.ttlMs) {
+        result.push({ conversationId, entry });
+      }
+    }
+    return result;
   }
 
   clear(): void {
@@ -219,16 +304,30 @@ function extractSystemPrompt(messages: Array<{ role: string; content: unknown }>
 
 // ── Session resolution ──────────────────────────────────────────────
 
+/**
+ * Derive a stable conversation ID from the messages array.
+ * Uses the first user message content as a fingerprint —
+ * this is stable across requests in the same conversation
+ * since the gateway always sends the full message history.
+ */
+function deriveConversationIdFromMessages(messages: Array<{ role: string; content: unknown }>): string {
+  const firstUser = messages.find((m) => m.role === "user");
+  if (!firstUser) return "default";
+  const content = flattenContent(firstUser.content).slice(0, 500);
+  const hash = createHash("sha256").update(content).digest("hex").slice(0, 16);
+  return `derived-${hash}`;
+}
+
 function resolveConversationId(
   req: IncomingMessage,
   body: Record<string, any>,
-): string | undefined {
+): string {
   return (
     (req.headers["x-session-id"] as string) ||
     (req.headers["x-conversation-id"] as string) ||
     body.conversation_id ||
     body.metadata?.conversation_id ||
-    undefined
+    deriveConversationIdFromMessages(body.messages ?? [])
   );
 }
 
@@ -257,8 +356,6 @@ async function handleCompletions(
   const model = body.model?.replace(/^claude-runner\//, "") ?? "claude-opus-4-5";
   const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-
-
   const prompt = extractPromptFromMessages(messages);
   const systemPrompt = extractSystemPrompt(messages);
   const conversationId = resolveConversationId(req, body);
@@ -286,7 +383,7 @@ async function executeWithRetries(
   prompt: string,
   model: string,
   systemPrompt: string | undefined,
-  conversationId: string | undefined,
+  conversationId: string,
   stream: boolean,
   res: ServerResponse,
   requestId: string,
@@ -295,18 +392,18 @@ async function executeWithRetries(
   const maxRetries = config.maxRetries ?? MAX_RETRIES;
   let lastError = "";
 
-  // Resolve session
+  // Resolve session — derive stable ID if gateway doesn't send one
   let resumeSessionId: string | undefined;
   let newSessionId: string | undefined;
 
-  if (conversationId) {
-    const existing = sessionStore.get(conversationId);
-    if (existing) {
-      resumeSessionId = existing;
-    } else {
-      newSessionId = randomUUID();
-    }
+  const entry = sessionStore.get(conversationId);
+  if (entry?.claudeSessionId) {
+    resumeSessionId = entry.claudeSessionId;
+  } else {
+    newSessionId = randomUUID();
   }
+  // Consume any pending compact summary for the new session
+  const compactSummary = sessionStore.consumeCompactSummary(conversationId);
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (attempt > 0) {
@@ -315,10 +412,15 @@ async function executeWithRetries(
     }
 
     try {
+      // Merge compact summary into system prompt for fresh sessions after rotation
+      const effectiveSystemPrompt = compactSummary
+        ? [systemPrompt, `\n\n## Previous conversation summary\n${compactSummary}`].filter(Boolean).join('')
+        : systemPrompt;
+
       if (stream) {
-        await handleStreamingResponse(prompt, model, systemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
+        await handleStreamingResponse(prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
       } else {
-        await handleNonStreamingResponse(prompt, model, systemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
+        await handleNonStreamingResponse(prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
       }
       return;
     } catch (err: any) {
@@ -330,7 +432,7 @@ async function executeWithRetries(
       if (resumeSessionId && /no conversation found|session/i.test(lastError)) {
         resumeSessionId = undefined;
         newSessionId = randomUUID();
-        if (conversationId) sessionStore.record(conversationId, newSessionId);
+        sessionStore.record(conversationId, newSessionId);
         continue;
       }
 
@@ -402,7 +504,7 @@ async function handleStreamingResponse(
   systemPrompt: string | undefined,
   resumeSessionId: string | undefined,
   newSessionId: string | undefined,
-  conversationId: string | undefined,
+  conversationId: string,
   res: ServerResponse,
   requestId: string,
   config: BridgeConfig,
@@ -464,14 +566,27 @@ async function handleStreamingResponse(
         }
       }
 
-      // Result — session ID and completion
+      // Result — session ID, completion, and context usage
       if (msg.type === "result") {
         const result = msg as any;
-        if (conversationId && result.session_id) {
+        if (result.session_id) {
           sessionStore.record(conversationId, result.session_id);
         }
         if (result.subtype === "success" && result.result && !streamedDelta) {
           resultText = result.result;
+        }
+
+        // Extract context usage from SDK result
+        if (result.modelUsage) {
+          const usage = extractContextUsage(result.modelUsage);
+          if (usage) {
+            sessionStore.updateContextUsage(conversationId, usage);
+
+            // Check if compaction is needed
+            if (sessionStore.needsCompaction(conversationId)) {
+              scheduleCompaction(conversationId, result.result ?? resultText);
+            }
+          }
         }
       }
     }
@@ -501,12 +616,27 @@ async function handleStreamingResponse(
       });
     }
 
+    // Include context usage in the final SSE chunk
+    const contextInfo = sessionStore.getContextInfo(conversationId);
+
     sendSSE({
       id: requestId,
       object: "chat.completion.chunk",
       created: Math.floor(Date.now() / 1000),
       model,
       choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      ...(contextInfo ? {
+        usage: {
+          prompt_tokens: contextInfo.inputTokens,
+          completion_tokens: contextInfo.outputTokens,
+          total_tokens: contextInfo.totalTokens,
+        },
+        context: {
+          fill_percent: contextInfo.fillPercent,
+          context_window: contextInfo.contextWindow,
+          total_tokens: contextInfo.totalTokens,
+        },
+      } : {}),
     });
     res.write("data: [DONE]\n\n");
     res.end();
@@ -521,7 +651,7 @@ async function handleNonStreamingResponse(
   systemPrompt: string | undefined,
   resumeSessionId: string | undefined,
   newSessionId: string | undefined,
-  conversationId: string | undefined,
+  conversationId: string,
   res: ServerResponse,
   requestId: string,
   config: BridgeConfig,
@@ -538,7 +668,7 @@ async function handleNonStreamingResponse(
     for await (const msg of q) {
       if (msg.type === "result") {
         const result = msg as any;
-        if (conversationId && result.session_id) {
+        if (result.session_id) {
           sessionStore.record(conversationId, result.session_id);
         }
         if (result.subtype === "success") {
@@ -547,13 +677,32 @@ async function handleNonStreamingResponse(
           const errors = result.errors?.join("; ") ?? "Unknown error";
           throw new Error(errors);
         }
+
+        // Extract context usage
+        if (result.modelUsage) {
+          const usage = extractContextUsage(result.modelUsage);
+          if (usage) {
+            sessionStore.updateContextUsage(conversationId, usage);
+            if (sessionStore.needsCompaction(conversationId)) {
+              scheduleCompaction(conversationId, resultText);
+            }
+          }
+        }
       }
     }
   } finally {
     activeQueries.delete(requestId);
   }
 
-  res.writeHead(200, { "Content-Type": "application/json" });
+  const contextInfo = sessionStore.getContextInfo(conversationId);
+
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+    ...(contextInfo ? {
+      "X-Context-Fill-Percent": String(Math.round(contextInfo.fillPercent * 100)),
+      "X-Context-Window": String(contextInfo.contextWindow),
+    } : {}),
+  });
   res.end(
     JSON.stringify({
       id: requestId,
@@ -567,9 +716,70 @@ async function handleNonStreamingResponse(
           finish_reason: "stop",
         },
       ],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      usage: {
+        prompt_tokens: contextInfo?.inputTokens ?? 0,
+        completion_tokens: contextInfo?.outputTokens ?? 0,
+        total_tokens: contextInfo?.totalTokens ?? 0,
+      },
+      ...(contextInfo ? {
+        context: {
+          fill_percent: contextInfo.fillPercent,
+          context_window: contextInfo.contextWindow,
+          total_tokens: contextInfo.totalTokens,
+        },
+      } : {}),
     }),
   );
+}
+
+// ── Context usage extraction ───────────────────────────────────────
+
+function extractContextUsage(modelUsage: Record<string, any>): ContextUsage | undefined {
+  // modelUsage is keyed by model name — aggregate across all models
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadInputTokens = 0;
+  let cacheCreationInputTokens = 0;
+  let contextWindow = 200_000;
+  let costUsd = 0;
+
+  for (const usage of Object.values(modelUsage)) {
+    inputTokens += usage.inputTokens ?? 0;
+    outputTokens += usage.outputTokens ?? 0;
+    cacheReadInputTokens += usage.cacheReadInputTokens ?? 0;
+    cacheCreationInputTokens += usage.cacheCreationInputTokens ?? 0;
+    if (usage.contextWindow) contextWindow = usage.contextWindow;
+    costUsd += usage.costUSD ?? 0;
+  }
+
+  const totalTokens = inputTokens + outputTokens;
+  if (totalTokens === 0) return undefined;
+
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadInputTokens,
+    cacheCreationInputTokens,
+    contextWindow,
+    totalTokens,
+    fillPercent: totalTokens / contextWindow,
+    costUsd,
+  };
+}
+
+// ── Compaction ─────────────────────────────────────────────────────
+
+function scheduleCompaction(conversationId: string, lastResult: string): void {
+  // Generate a summary request to compact the conversation.
+  // We rotate the session immediately — the next request will start
+  // a fresh session with the summary injected as system prompt context.
+  const summary = [
+    "The conversation was compacted due to high context usage.",
+    "Key context from the previous conversation:",
+    lastResult ? `Last assistant response: ${lastResult.slice(0, 2000)}` : "",
+  ].filter(Boolean).join("\n");
+
+  sessionStore.rotateSession(conversationId, summary);
 }
 
 // ── Server lifecycle ────────────────────────────────────────────────
@@ -587,6 +797,7 @@ export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<type
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Conversation-Id");
+      res.setHeader("Access-Control-Expose-Headers", "X-Context-Fill-Percent, X-Context-Window");
 
       if (req.method === "OPTIONS") {
         res.writeHead(204);
@@ -614,6 +825,47 @@ export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<type
             ],
           }),
         );
+        return;
+      }
+
+      // Session context info endpoint
+      if (req.url?.startsWith("/v1/sessions") && req.method === "GET") {
+        const sessionId = req.url.split("/v1/sessions/")[1];
+        if (sessionId) {
+          // Single session context info
+          const info = sessionStore.getContextInfo(sessionId);
+          const entry = sessionStore.get(sessionId);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            session_id: sessionId,
+            turn_count: entry?.turnCount ?? 0,
+            context: info ? {
+              fill_percent: info.fillPercent,
+              fill_percent_display: `${Math.round(info.fillPercent * 100)}%`,
+              context_window: info.contextWindow,
+              input_tokens: info.inputTokens,
+              output_tokens: info.outputTokens,
+              total_tokens: info.totalTokens,
+              cost_usd: info.costUsd,
+            } : null,
+            needs_compaction: sessionStore.needsCompaction(sessionId),
+          }));
+        } else {
+          // List all sessions
+          const sessions = sessionStore.getAllSessions().map(({ conversationId, entry }) => ({
+            session_id: conversationId,
+            turn_count: entry.turnCount,
+            last_used: entry.lastUsed,
+            context: entry.contextUsage ? {
+              fill_percent: entry.contextUsage.fillPercent,
+              fill_percent_display: `${Math.round(entry.contextUsage.fillPercent * 100)}%`,
+              context_window: entry.contextUsage.contextWindow,
+              total_tokens: entry.contextUsage.totalTokens,
+            } : null,
+          }));
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ sessions }));
+        }
         return;
       }
 
