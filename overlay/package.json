@@ -1,0 +1,12 @@
+{
+  "name": "@openclaw/context-overlay",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node --import tsx src/discord-context-overlay.ts"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "tsx": "^4.19.0"
+  }
+}
