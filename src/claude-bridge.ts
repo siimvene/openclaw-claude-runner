@@ -202,19 +202,12 @@ function trimPromptHistory(text: string, maxChars = PROMPT_HISTORY_MAX_CHARS): s
 }
 
 function extractPromptFromMessages(messages: Array<{ role: string; content: unknown }>): string {
-  // OpenClaw sends conversation history. Preserve it so the SDK has full context.
-  const conversational = messages
-    .filter((m) => m.role !== "system")
-    .slice(-PROMPT_HISTORY_MAX_MESSAGES)
-    .map((m) => {
-      const content = flattenContent(m.content).trim();
-      if (!content) return "";
-      return `${formatRoleLabel(m.role)}:\n${content}`;
-    })
-    .filter(Boolean)
-    .join("\n\n");
-
-  return trimPromptHistory(conversational);
+  // Only send the latest user message — the SDK manages conversation
+  // history internally via session resume. Sending the full history
+  // as a giant prompt triggers Anthropic's third-party detection.
+  const userMsgs = messages.filter((m) => m.role === "user");
+  if (userMsgs.length === 0) return "";
+  return flattenContent(userMsgs[userMsgs.length - 1].content);
 }
 
 function extractSystemPrompt(messages: Array<{ role: string; content: unknown }>): string | undefined {
@@ -263,6 +256,8 @@ async function handleCompletions(
   const stream = body.stream !== false;
   const model = body.model?.replace(/^claude-runner\//, "") ?? "claude-opus-4-5";
   const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+
 
   const prompt = extractPromptFromMessages(messages);
   const systemPrompt = extractSystemPrompt(messages);
@@ -381,7 +376,7 @@ function buildQueryOptions(
   }
 
   if (systemPrompt) {
-    opts.systemPrompt = systemPrompt;
+    opts.appendSystemPrompt = systemPrompt;
   }
 
   if (config.tools) {
