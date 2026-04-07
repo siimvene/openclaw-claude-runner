@@ -97,6 +97,18 @@ openclaw config set agents.defaults.model.fallbacks '["anthropic/claude-opus-4-5
 
 Claude CLI is not authenticated. Run `claude login` on the server.
 
+**"No API key found for provider claude-runner"**
+
+OpenClaw requires an auth profile even though the SDK authenticates via your Claude Code login. The install script creates this automatically, but if you see this error, add it manually:
+
+```bash
+# For the main agent
+mkdir -p ~/.openclaw/agents/main/agent
+echo '{"claude-runner:default":{"type":"api_key","provider":"claude-runner","key":"claude-runner-local"}}' > ~/.openclaw/agents/main/agent/auth-profiles.json
+```
+
+If you have multiple agents, copy the profile to each agent's directory or merge it into the existing `auth-profiles.json`.
+
 **Bridge not responding**
 
 Check if the bridge is running: `curl http://127.0.0.1:7779/health`

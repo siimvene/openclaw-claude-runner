@@ -51,6 +51,26 @@ openclaw config set models.providers.claude-runner.authHeader false 2>/dev/null 
 
 echo "Provider configured."
 
+# Create auth profile for the main agent so OpenClaw doesn't complain about missing API key
+AUTH_DIR="$HOME/.openclaw/agents/main/agent"
+AUTH_FILE="$AUTH_DIR/auth-profiles.json"
+if [ -f "$AUTH_FILE" ]; then
+  # Add claude-runner profile if not already present
+  if ! grep -q "claude-runner:default" "$AUTH_FILE" 2>/dev/null; then
+    python3 -c "
+import json, sys
+with open('$AUTH_FILE') as f: d = json.load(f)
+d['claude-runner:default'] = {'type': 'api_key', 'provider': 'claude-runner', 'key': 'claude-runner-local'}
+with open('$AUTH_FILE', 'w') as f: json.dump(d, f, indent=2)
+print('Added claude-runner auth profile to', '$AUTH_FILE')
+" 2>/dev/null || echo "Could not auto-add auth profile. See README troubleshooting."
+  fi
+else
+  mkdir -p "$AUTH_DIR"
+  echo '{"claude-runner:default":{"type":"api_key","provider":"claude-runner","key":"claude-runner-local"}}' > "$AUTH_FILE"
+  echo "Created auth profile at $AUTH_FILE"
+fi
+
 echo ""
 echo "Done! Remaining steps:"
 echo ""
