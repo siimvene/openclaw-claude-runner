@@ -71,6 +71,63 @@ else
   echo "Created auth profile at $AUTH_FILE"
 fi
 
+# ── Context Overlay (optional) ──────────────────────────────────────
+
+OVERLAY_DIR="$EXT_DIR/overlay"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ -d "$SCRIPT_DIR/overlay" ]; then
+  echo ""
+  echo "Installing context overlay..."
+  mkdir -p "$OVERLAY_DIR"
+  cp "$SCRIPT_DIR/overlay/discord-context-overlay.ts" "$OVERLAY_DIR/"
+  cp "$SCRIPT_DIR/overlay/package.json" "$OVERLAY_DIR/"
+  cp "$SCRIPT_DIR/overlay/install.sh" "$OVERLAY_DIR/"
+  chmod +x "$OVERLAY_DIR/install.sh"
+
+  cd "$OVERLAY_DIR"
+  npm install --silent 2>/dev/null
+
+  # Extract Discord token from OpenClaw config
+  OPENCLAW_CONFIG="$HOME/.openclaw/openclaw.json"
+  DISCORD_TOKEN=""
+  if [ -f "$OPENCLAW_CONFIG" ]; then
+    DISCORD_TOKEN=$(python3 -c "import json; d=json.load(open('$OPENCLAW_CONFIG')); print(d.get('channels',{}).get('discord',{}).get('token',''))" 2>/dev/null || true)
+  fi
+
+  if [ -n "$DISCORD_TOKEN" ]; then
+    # Create systemd service
+    SERVICE_FILE="$HOME/.config/systemd/user/openclaw-context-overlay.service"
+    mkdir -p "$(dirname "$SERVICE_FILE")"
+
+    cat > "$SERVICE_FILE" << UNIT
+[Unit]
+Description=OpenClaw Context Overlay (Discord)
+After=openclaw-gateway.service
+
+[Service]
+Type=simple
+WorkingDirectory=$OVERLAY_DIR
+Environment=DISCORD_TOKEN=$DISCORD_TOKEN
+Environment=BRIDGE_URL=http://127.0.0.1:7779/v1
+ExecStart=/usr/bin/node --import tsx discord-context-overlay.ts
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user enable openclaw-context-overlay 2>/dev/null || true
+    echo "Context overlay installed and enabled."
+    echo "Start it with: systemctl --user start openclaw-context-overlay"
+  else
+    echo "Context overlay installed but no Discord token found."
+    echo "Set DISCORD_TOKEN and run: cd $OVERLAY_DIR && bash install.sh"
+  fi
+fi
+
 echo ""
 echo "Done! Remaining steps:"
 echo ""
