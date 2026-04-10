@@ -194,7 +194,7 @@ OpenClaw requires an auth profile even though the SDK authenticates via your Cla
 ```bash
 # For the main agent
 mkdir -p ~/.openclaw/agents/main/agent
-echo '{"claude-runner:default":{"type":"api_key","provider":"claude-runner","key":"claude-runner-local"}}' > ~/.openclaw/agents/main/agent/auth-profiles.json
+echo '{"version":1,"profiles":{"claude-runner:default":{"type":"api_key","provider":"claude-runner","key":"claude-runner-local"}}}' > ~/.openclaw/agents/main/agent/auth-profiles.json
 ```
 
 If you have multiple agents, copy the profile to each agent's directory or merge it into the existing `auth-profiles.json`.
