@@ -11,6 +11,11 @@ cp src/claude-bridge.ts "$EXT_DIR/src/"
 cp openclaw.plugin.json "$EXT_DIR/"
 cp package.json "$EXT_DIR/"
 
+# Install npm dependencies in extension directory
+echo "Installing npm dependencies..."
+cd "$EXT_DIR" && npm install --silent
+cd - >/dev/null
+
 # Create config.json from example if it doesn't exist
 if [ ! -f "$EXT_DIR/config.json" ]; then
   cp config.example.json "$EXT_DIR/config.json"
