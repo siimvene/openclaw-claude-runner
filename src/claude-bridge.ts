@@ -623,6 +623,16 @@ async function handleStreamingResponse(
       });
     }
 
+    // Append context status bar as final text delta
+    const contextBar = buildContextBar(conversationId);
+    sendSSE({
+      id: requestId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta: { content: contextBar }, finish_reason: null }],
+    });
+
     // Include context usage in the final SSE chunk
     const contextInfo = sessionStore.getContextInfo(conversationId);
 
@@ -701,6 +711,9 @@ async function handleNonStreamingResponse(
     activeQueries.delete(requestId);
   }
 
+  // Append context status bar to response
+  resultText += buildContextBar(conversationId);
+
   const contextInfo = sessionStore.getContextInfo(conversationId);
 
   res.writeHead(200, {
@@ -737,6 +750,32 @@ async function handleNonStreamingResponse(
       } : {}),
     }),
   );
+}
+
+// ── Context status bar ────────────────────────────────────────────
+
+function buildContextBar(conversationId: string): string {
+  const entry = sessionStore.get(conversationId);
+  const info = entry?.contextUsage;
+  const turn = entry?.turnCount ?? 0;
+
+  if (!info) {
+    return `\n\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591 0% \u00b7 Turn ${turn}`;
+  }
+
+  const fillPct = Math.round(info.fillPercent * 100);
+  const filled = Math.round(fillPct / 10);
+  const bar = "\u2588".repeat(filled) + "\u2591".repeat(10 - filled);
+  const tokensK = (info.totalTokens / 1000).toFixed(1);
+  const windowK = (info.contextWindow / 1000).toFixed(0);
+
+  const parts = [`${bar} ${fillPct}%`, `Turn ${turn}`, `${tokensK}k / ${windowK}k tokens`];
+
+  if (sessionStore.needsCompaction(conversationId)) {
+    parts.push("\u26a0 compacting soon");
+  }
+
+  return `\n${parts.join(" \u00b7 ")}`;
 }
 
 // ── Context usage extraction ───────────────────────────────────────
