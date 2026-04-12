@@ -789,12 +789,18 @@ function extractContextUsage(modelUsage: Record<string, any>): ContextUsage | un
   let contextWindow = 1_000_000;
   let costUsd = 0;
 
-  for (const usage of Object.values(modelUsage)) {
+  // Known 1M context models — the SDK may underreport as 200K
+  const KNOWN_1M_MODELS = ["claude-opus-4-6"];
+
+  for (const [modelKey, usage] of Object.entries(modelUsage)) {
     inputTokens += usage.inputTokens ?? 0;
     outputTokens += usage.outputTokens ?? 0;
     cacheReadInputTokens += usage.cacheReadInputTokens ?? 0;
     cacheCreationInputTokens += usage.cacheCreationInputTokens ?? 0;
-    if (usage.contextWindow) contextWindow = usage.contextWindow;
+    if (usage.contextWindow) {
+      const is1M = KNOWN_1M_MODELS.some((m) => modelKey.includes(m));
+      contextWindow = is1M ? 1_000_000 : usage.contextWindow;
+    }
     costUsd += usage.costUSD ?? 0;
   }
 
