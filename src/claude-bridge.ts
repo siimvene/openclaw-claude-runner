@@ -306,15 +306,18 @@ function extractSystemPrompt(messages: Array<{ role: string; content: unknown }>
 
 /**
  * Derive a stable conversation ID from the messages array.
- * Uses the first user message content as a fingerprint —
- * this is stable across requests in the same conversation
- * since the gateway always sends the full message history.
+ * Hashes the role sequence + all user message content so that
+ * different conversations with the same opening message don't collide.
  */
 function deriveConversationIdFromMessages(messages: Array<{ role: string; content: unknown }>): string {
-  const firstUser = messages.find((m) => m.role === "user");
-  if (!firstUser) return "default";
-  const content = flattenContent(firstUser.content).slice(0, 500);
-  const hash = createHash("sha256").update(content).digest("hex").slice(0, 16);
+  if (messages.length === 0) return "default";
+  const fingerprint = messages
+    .map((m, i) => {
+      const text = m.role === "user" ? flattenContent(m.content).slice(0, 200) : "";
+      return `${i}:${m.role}:${text}`;
+    })
+    .join("|");
+  const hash = createHash("sha256").update(fingerprint).digest("hex").slice(0, 16);
   return `derived-${hash}`;
 }
 
@@ -412,10 +415,14 @@ async function executeWithRetries(
     }
 
     try {
-      // Merge compact summary into system prompt for fresh sessions after rotation
-      const effectiveSystemPrompt = compactSummary
-        ? [systemPrompt, `\n\n## Previous conversation summary\n${compactSummary}`].filter(Boolean).join('')
-        : systemPrompt;
+      // Only send system prompt on first turn — resumed sessions already have it.
+      // Sending it again causes duplicate instructions and can trigger repeated responses.
+      let effectiveSystemPrompt: string | undefined;
+      if (!resumeSessionId) {
+        effectiveSystemPrompt = compactSummary
+          ? [systemPrompt, `\n\n## Previous conversation summary\n${compactSummary}`].filter(Boolean).join('')
+          : systemPrompt;
+      }
 
       if (stream) {
         await handleStreamingResponse(prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
