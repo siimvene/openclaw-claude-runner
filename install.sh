@@ -11,6 +11,11 @@ cp src/claude-bridge.ts "$EXT_DIR/src/"
 cp openclaw.plugin.json "$EXT_DIR/"
 cp package.json "$EXT_DIR/"
 
+# Install npm dependencies in extension directory
+echo "Installing npm dependencies..."
+cd "$EXT_DIR" && npm install --silent
+cd - >/dev/null
+
 # Create config.json from example if it doesn't exist
 if [ ! -f "$EXT_DIR/config.json" ]; then
   cp config.example.json "$EXT_DIR/config.json"
@@ -60,14 +65,16 @@ if [ -f "$AUTH_FILE" ]; then
     python3 -c "
 import json, sys
 with open('$AUTH_FILE') as f: d = json.load(f)
-d['claude-runner:default'] = {'type': 'api_key', 'provider': 'claude-runner', 'key': 'claude-runner-local'}
+if 'profiles' not in d:
+    d = {'version': 1, 'profiles': d}
+d['profiles']['claude-runner:default'] = {'type': 'api_key', 'provider': 'claude-runner', 'key': 'claude-runner-local'}
 with open('$AUTH_FILE', 'w') as f: json.dump(d, f, indent=2)
 print('Added claude-runner auth profile to', '$AUTH_FILE')
 " 2>/dev/null || echo "Could not auto-add auth profile. See README troubleshooting."
   fi
 else
   mkdir -p "$AUTH_DIR"
-  echo '{"claude-runner:default":{"type":"api_key","provider":"claude-runner","key":"claude-runner-local"}}' > "$AUTH_FILE"
+  echo '{"version":1,"profiles":{"claude-runner:default":{"type":"api_key","provider":"claude-runner","key":"claude-runner-local"}}}' > "$AUTH_FILE"
   echo "Created auth profile at $AUTH_FILE"
 fi
 
